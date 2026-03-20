@@ -73,6 +73,9 @@ class Downsample(nn.Module):
     """
     Downsampling layer that halves the spatial dimensions (height and width)
 
+    Input has shape (B, H, W, C) where C is the number of input channels and the output should have shape (B, H/2, W/2, C)
+    where H and W are assumed to be even
+
     Originally, I was going to use nn.MaxPool2d(kernel_size=2, stride=2) which considers a 2x2 grid (starting in the top-left corner
     with no padding, so that the entire 2x2 grid is fully contained within the image) and consolidates ("pools") the 4 values in the
     2x2 grid into a single value by taking the maximum of those 4 values. Note that the stride of 2 applies both horizontally and
@@ -92,7 +95,8 @@ class Downsample(nn.Module):
 
     def __init__(self, channels):
         super().__init__()
-
+        self.channels = channels
+        
         # out_channels is the number of filters, an integer for kernel_size gives a square grid, so kernel_size=3 gives a 3x3 grid
         self.conv = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, stride=2, padding=1)
 
@@ -104,6 +108,8 @@ class Downsample(nn.Module):
         B, H, W, C = x.shape
         if H % 2 != 0 or W % 2 != 0:
             raise ValueError(f"{x.shape=}, height and width should be even but {H=}, {W=}")
+        if C != self.channels:
+            raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
         return self.conv(x)
 
 
@@ -120,25 +126,39 @@ class Upsample(nn.Module):
     I was going to use nn.ConvTranspose2d(in_channels=F, out_channels=F//2, kernel_size=2, stride=2) which has a stride of 2 which 
     means that each 2x2 output matrix (which corresponds to each input pixel) would not overlap with any of the other 2x2 output
     matrices. People claim that transposed convolution (a.k.a. "deconvolution") results in checkboard artifacts, but I feel like
-    this should only happen when the stride doesn't divide the kernel size and thus the output matrices overlap. In my case, there
+    this should only happen when the stride and kernel size are chosen such that the output matrices overlap. In my case, there
     would be no overlap so I wouldn't expect checkboard artifacts. Regardless, I'm going to instead try the nearest-neighbor upsampling
-    because I should learn what it is: TODO
+    because I should learn what it is:
 
-    TODO:
-
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+    Nearest-neighbor upsampling is actually pretty simple: you call `F.interpolate(x, scale_factor=2, mode='nearest')` and then apply
+    a convolution to its output, e.g. `nn.Conv2d(channels, channels, kernel_size=3, padding=1)`. The choice to use a 3x3 convolution 
+    seems like it is kind of arbitrary, I am just copying this from https://github.com/KellyYutongHe/cmu-10799-diffusion/blob/main/src/models/blocks.py#L286
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=2, mode='nearest')
-        return self.conv(x)
-
+    So what does `F.interpolate(x, scale_factor=2, mode='nearest')` actually do? Suppose x has shape (B, H, W, C), consider a single
+    H-by-W grid for a fixed batch and channel. We define H' = round(scale_factor * H) and W' = round(scale_factor * W) (I don't actually
+    know how rounding is done, but it isn't important), so the height of our grid went from having indices [0, 1, 2, ..., H-1] to having
+    indices [0, 1, 2, ..., H'-1] and in our case H' = 2*H. If we have some height index h' in our new grid, we determine its value by 
+    computing `index = round(h' * H/H')` which effectively divides by the scale factor which initially gives a value that might not be
+    an integer (and thus not a valid index) and so the `mode='nearest'` argument makes the decision to round it to the nearest (presumably
+    valid) integer to determine the index `h` to use in the original grid and then uses the pixel value at (h, w) (assuming w was determined
+    in an analogous way for the width) as the value at (h', w') in the new grid. I don't know the precise rounding details and said "presumably
+    valid" earlier because if H=10 and H'=20, we'd have height indices [0, 1, ..., 9] and [0, 1, ..., 19] and 19/2 = 9.5 and round(9.5) might
+    give 10 which would be an invalid index, so 9 would be the only valid choice --- I'm not worrying about minor details like this. I'm
+    guessing that other options for `mode` like 'linear' just linearly interpolate between the two pixel values in the original grid. My
+    understanding is that this interpolate operation is performed independently for every channel. 
     """
 
-    def __init__(self):
+    def __init__(self, channels):
         super().__init__()
-
+        self.channels = channels
+        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+    
+    def forward(self, x):
+        B, H, W, C = x.shape
+        if C != self.channels:
+            raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
+        x = F.interpolate(x, scale_factor=2, mode='nearest')
+        return self.conv(x)
 
 
 class UNet(nn.Module):
