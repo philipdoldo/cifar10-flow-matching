@@ -89,11 +89,12 @@ class Downsample(nn.Module):
     we are using C filters, so this comes at the cost of adding 9*C^2 parameters, but it might learn a smarter pooling approach. I got this
     idea from https://github.com/KellyYutongHe/cmu-10799-diffusion/blob/main/src/models/blocks.py#L254 where I also took some other minor
     inspirations from here and there.
-
-    `channels` is an integer which is the number of input channels (and output channels)
     """
 
     def __init__(self, channels):
+        """
+        `channels` is an integer which is the number of input channels (and output channels)
+        """
         super().__init__()
         self.channels = channels
         
@@ -149,6 +150,9 @@ class Upsample(nn.Module):
     """
 
     def __init__(self, channels):
+        """
+        `channels` is an integer which is the number of input channels (and output channels)
+        """
         super().__init__()
         self.channels = channels
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
@@ -162,6 +166,9 @@ class Upsample(nn.Module):
 
 
 class UNet(nn.Module):
+    """
+    Inspired by https://arxiv.org/abs/1505.04597 but not intended to be a faithful replication of their implementation.
+    """
 
     def __init__(self, config):
         super().__init__()
