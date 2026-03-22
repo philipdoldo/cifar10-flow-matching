@@ -350,13 +350,17 @@ class SelfAttention(nn.Module):
 
 @dataclass
 class UNetConfig: # TODO actually write this config class
-    in_channels: int = 3
-    model_channels: int = 128
-    channel_multipliers: tuple = (1, 2, 4, 8)
-    num_blocks: int = 1
-    time_embed_dim: int = 128
+    channels: int = 3
+    initial_image_height: int = 32
+    min_image_height: int = 4 # the smallest we allow our image height to get from downsampling
+    max_attention_height: int = 16 # maximum image height such that the "sequence length" is short enough to use attention without being too expensive
+    base_channels: int = 64 # number of output channels of first ResNetBlock 
+    d: int = 128 # time/class embedding dimension
+    time_and_class_mlp_hidden_dim: int = None
+    num_classes: int = 10 # number of classes the dataset has, e.g. for CIFAR10 (if something like CelebA where you have a vector of attributes, you need to embed it differently, don't worry about it for now)
+    sinusoidal_base: int = 10000
     dropout: float = 0.0
-    num_heads: int = 4
+    attention_heads: int = 4
 
     @classmethod
     def from_yaml(cls, path: str) -> "UNetConfig":
