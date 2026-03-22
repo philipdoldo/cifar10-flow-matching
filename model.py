@@ -518,7 +518,7 @@ class UNet(nn.Module):
 
 if __name__ == "__main__":
 
-    config = UNetConfig()
+    config = UNetConfig(base_channels=64)
     unet = UNet(config)
 
     x = torch.randn((2, 3, 32, 32))
@@ -528,3 +528,7 @@ if __name__ == "__main__":
 
     z = unet(x=x, t=t, y=y)
     print(f"{z.shape=}")
+
+    params = sum(p.numel() for p in unet.parameters())
+    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    print(f"{params=:,}, {trainable_params=:,}")
