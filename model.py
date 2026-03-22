@@ -17,12 +17,12 @@ class SinusoidalEmbedding(nn.Module):
     
     def forward(self, t):
         """
-        `t` has shape (B, 1) --- batch of times in [0, 1]
+        `t` has shape (B,) --- batch of times in [0, 1]
         `t` gets mapped to a batch of embeddings of dimension d --- output has shape (B, d)
         """
         i = torch.arange(self.d // 2, device=t.device) # shape (d//2)
         freqs = 1/self.base ** ((2 * i) / self.d) # shape (d//2)
-        angles = freqs * t # (d//2) * (B, 1) --> broadcasts to (B, d//2)
+        angles = freqs * t[:, None] # (d//2) * (B, 1) --> broadcasts to (B, d//2)
         return torch.cat([angles.sin(), angles.cos()], dim=-1)
     
 
@@ -59,15 +59,18 @@ class TimeAndClassEmbedding(nn.Module):
     
     def forward(self, t, y):
         """
-        `t` has shape (B, 1) --- batch of times which are scalars in [0, 1]
-        `y` has shape (B, 1) --- batch of class labels which are in {0, ..., 10}. Class labels in {0, ..., 9} correspond to MNIST 
+        `t` has shape (B,) --- batch of times which are scalars in [0, 1]
+        `y` has shape (B,) --- batch of class labels which are in {0, ..., 10}. Class labels in {0, ..., 9} correspond to MNIST 
         digits and a class label of 10 corresponds to the empty class label, which is used for classifier-free guidance (CFG)
 
         output a batch of embedding vectors: shape (B, d)
         """
         class_emb = self.class_embedding(y) # shape (B, d)
+        print(f"{class_emb.shape=}")
         time_emb = self.time_embedding(t) # shape (B, d)
+        print(f"{time_emb.shape=}")
         embeddings = self.mlp(class_emb + time_emb) # shape (B, d)
+        print(f"{embeddings.shape=}")
         return embeddings # shape (B, d)
 
 
@@ -402,7 +405,7 @@ class UNet(nn.Module):
         self.d = config.d # time/class embedding dimension
         self.dropout = config.dropout # dropout probability for resnetblocks
 
-        self.time_and_class_embedding = TimeAndClassEmbedding(self, config.d, hidden_dim=config.time_and_class_mlp_hidden_dim, num_classes=config.num_classes, base=config.sinusoidal_base)
+        self.time_and_class_embedding = TimeAndClassEmbedding(d=config.d, hidden_dim=config.time_and_class_mlp_hidden_dim, num_classes=config.num_classes, base=config.sinusoidal_base)
 
         # Encoder/Downward portion of the U-Net
         self.encoder_resnets = nn.ModuleList()
@@ -468,8 +471,8 @@ class UNet(nn.Module):
     def forward(self, x, t, y):
         """
         `x` has shape (B, C, H, W) --- batch of noise samples which are the same shape as a batch of images
-        `t` has shape (B, 1) --- batch of times which are scalars in [0, 1]
-        `y` has shape (B, 1) --- batch of class labels which are in {0, ..., num_classes}. Class labels in {0, ..., num_classes-1}
+        `t` has shape (B,) --- batch of times which are scalars in [0, 1]
+        `y` has shape (B,) --- batch of class labels which are in {0, ..., num_classes}. Class labels in {0, ..., num_classes-1}
         correspond to the regular class labels and a class label of num_classes corresponds to the empty class label, which is used for classifier-free guidance (CFG)
 
         Remember that this model, when used in a flow model, is the guided vector field u_t^{theta}(x|y) which induces
@@ -511,3 +514,17 @@ class UNet(nn.Module):
         x = rmsnorm(x)
         x = F.relu(x).square()
         return self.output_conv(x)
+
+
+if __name__ == "__main__":
+
+    config = UNetConfig()
+    unet = UNet(config)
+
+    x = torch.randn((2, 3, 32, 32))
+    t = torch.tensor([0.5, 0.2])
+    y = torch.tensor([5, 7])
+    print(f"{x.shape=}, {t.shape=}, {y.shape=}")
+
+    z = unet(x=x, t=t, y=y)
+    print(f"{z.shape=}")
