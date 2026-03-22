@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.functional as F
+from dataclasses import dataclass
+import yaml
+import math
 
 
 class SinusoidalEmbedding(nn.Module):
@@ -161,7 +164,11 @@ class Upsample(nn.Module):
     """
     Upsampling layer that doubles the spatial dimensions (height and width)
 
-    Input has shape (B, C, H, W) where C is the number of input channels and the output should have shape (B, C, 2*H, 2*W)
+    Input has shape (B, C, H, W) where C is the number of input channels and the output should have shape (B, C//2, 2*H, 2*W)
+
+    Something I almost forgot was to be sure our convolution halves the number of channels because we'll be concatenating along
+    the channel dimension with the output from the encoder via the skip connection, so really this class upsamples AND 
+
 
     Originally I was going to do a "transposed convolution" which uses C filters of of shape (C, 2, 2) and for each pixel value
     in a given channel, the pixel value p scales all 4 values in the 2x2 grid for the current value which results in a 2x2 for
@@ -177,6 +184,8 @@ class Upsample(nn.Module):
     Nearest-neighbor upsampling is actually pretty simple: you call `F.interpolate(x, scale_factor=2, mode='nearest')` and then apply
     a convolution to its output, e.g. `nn.Conv2d(channels, channels, kernel_size=3, padding=1)`. The choice to use a 3x3 convolution 
     seems like it is kind of arbitrary, I am just copying this from https://github.com/KellyYutongHe/cmu-10799-diffusion/blob/main/src/models/blocks.py#L286
+    EDIT: I think there was a typo and they meant to do `nn.Conv2d(channels, channels, kernel_size=3, padding=1)` which explains why I
+    thought it felt arbitrary at first, turns out it is necessary for halving the channels to make the channel size work with the concatenation.
     
     So what does `F.interpolate(x, scale_factor=2, mode='nearest')` actually do? Suppose x has shape (B, C, H, W), consider a single
     H-by-W grid for a fixed batch and channel. We define H' = round(scale_factor * H) and W' = round(scale_factor * W) (I don't actually
@@ -198,7 +207,8 @@ class Upsample(nn.Module):
         """
         super().__init__()
         self.channels = channels
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # The convolution halves the number of channels to account for the concatenation from the skip connection, see Fig. 1 in  https://arxiv.org/pdf/1505.04597
+        self.conv = nn.Conv2d(channels, channels//2, kernel_size=3, padding=1)
     
     def forward(self, x):
         B, C, H, W = x.shape
@@ -208,7 +218,7 @@ class Upsample(nn.Module):
         return self.conv(x)
 
 
-class Block(nn.Module):
+class ResNetBlock(nn.Module):
     """
     Partially inspired by https://github.com/KellyYutongHe/cmu-10799-diffusion/blob/main/src/models/blocks.py#L85
     I'm choosing not to use FiLM for now to keep things simple, can always ablate later
@@ -275,25 +285,166 @@ class Block(nn.Module):
         return h + self.skip_connection(x) # (B, out_channels, H, W)
 
 
+class SelfAttention(nn.Module):
+    """
+    - No causal mask
+    - Takes (B, C, H, W) as input but will *effectively* treat it like (B, H*W, C) where H*W is the sequence length and C is 
+    the "token" embedding dimension, though we'll use a 1x1 convolution on this input to go from (B, C, H, W) to (B, 3*C, H, W)
+    and then reshape to (B, H*W, 3*C) to effectively get our q, k, v tensors all in one rather than reshaping our input from
+    (B, C, H, W) to (B, H*W, C) and then using three separate linear layers to compute `q, k, v = W_q(x), W_k(x), W_v(x)` 
+    because the convolution approach should only have to launch a single kernel rather than three separate kernels for each of
+    the linear layers. I don't actually know if this makes a difference in practice, maybe torch.compile() would fuse the three
+    linear layers anyway, I have no idea, but the point is that the convolutional approach is also valid and effectively equivalent
+    to the three linear layers, so we might as well use it since it seems like it'll probably be faster than the three linear layers. 
+    - We also use a 1x1 convolution for the output project because it is equivalent and it skips an extra transpose that would be
+    required to do a regular linear layer while still returning the correct output shape
+    - I won't use RoPE for now. Seems like ViTs have used 2D RoPE before? maybe test that later
+    """
+    def __init__(self, channels:int, num_heads: int):
+        super().__init__()
+
+        self.channels = channels
+        self.num_heads = num_heads
+
+        self.qkv_conv = nn.Conv2d(channels, 3*channels, kernel_size=1) # effectively acts like the 3 projection matrices W_q, W_k, and W_v
+        self.output_conv = nn.Conv2d(channels, channels, kernel_size=1) # effectively acts like the linear output projection W_o
+
+    
+    def forward(self, x):
+        """
+        `x` has shape (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        if C != self.channels:
+            raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
+        if C % self.num_heads != 0:
+            raise ValueError(f"{C=}, {self.num_heads=}, {C/self.num_heads=} we need our head_size to be an integer")
+        head_size = C // self.num_heads
+
+
+        qkv = self.qkv_conv(x) # (B, 3*C, H, W)
+
+        qkv = qkv.view(B, 3, self.num_heads, head_size, H * W)  # (B, 3, num_heads, head_size, H*W)
+        qkv = qkv.permute(1, 0, 2, 4, 3)  # (3, B, num_heads, H*W, head_size)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, num_heads, H*W, head_size)
+
+        assert q.shape[-1] == head_size, f"{q.shape=}, {head_size=}"
+
+        # TODO: would apply RoPE to q and k here...
+
+        q, k = rmsnorm(q), rmsnorm(k) # QK norm
+
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=False) # (B, num_heads, H*W, head_dim)
+        
+        ##### Manual version of scaled_dot_product_attention (no causal mask) would be:
+        # att = (q @ k.transpose(3, 2)) * (1.0 / math.sqrt(head_size)) # (B, num_heads, H*W, H*W) <-- (B, num_heads, H*W, head_size) x (B, num_heads, head_size, H*W)
+        # att = F.softmax(att, dim=-1) # (B, num_heads, H*W, H*W)
+        # y = att @ v # (B, num_heads, H*W, head_dim) <-- (B, num_heads, H*W, H*W) x (B, num_heads, H*W, head_dim)
+
+        y = y.transpose(2, 3) # (B, num_heads, head_dim, H*W)
+        y = y.contiguous().view(B, C, H, W)
+        return 
+
+
+@dataclass
+class UNetConfig:
+    in_channels: int = 3
+    model_channels: int = 128
+    channel_multipliers: tuple = (1, 2, 4, 8)
+    num_blocks: int = 1
+    time_embed_dim: int = 128
+    dropout: float = 0.0
+    num_heads: int = 4
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "UNetConfig":
+        with open(path) as f:
+            return cls(**yaml.safe_load(f))
+
+def is_power_of_2(n: int):
+    """
+    returns True if `n` is an integer power of 2 and 0 otherwise
+    `&` computes bitwise AND between two integers, e.g. 8 & 7 = 0b1000 & 0b0111 = 0b0000 = 0
+    """
+    return n > 0 and (n & (n-1) == 0)
+
 class UNet(nn.Module):
     """
     Inspired by https://arxiv.org/abs/1505.04597 but not intended to be a faithful replication of their implementation.
+
+    Based on https://github.com/mattroz/diffusion-ddpm/blob/main/src/model/unet.py#L19 people downsample 3 times with 32x32 images (down to 4x4)
+
+    It seems like people typically rescale images to be square so that H = W and H and W are often chosen to be powers of 2. In this code, I am
+    simply going to assume that H = W = 2^n for some positive integer n. 
     """
 
-    def __init__(self, config):
+    def __init__(self, config: UNetConfig):
         super().__init__()
         self.config = config
+
+        self.channels = config.channels # initial channels in the image
+        self.H_init = config.initial_image_height # note: arbitrarily naming after height, could've chosen width since assuming square images
+        self.H_min = config.min_image_height # the smallest we allow the image spatial dimensions to get after downsampling
+        if not is_power_of_2(self.H_init) or not is_power_of_2(self.H_min) or self.H_min >= self.H_init:
+            raise ValueError(f"{self.H_init=}, {self.H_min=}, but need both to be powers of 2 and H_init must be greater than H_min")
+        self.num_downsamples = int(math.log2(self.H_init // self.H_min))
+        if self.num_downsamples < 1:
+            raise ValueError(f"{self.num_downsamples=}, {self.H_init=}, {self.H_min=}")
+
+        self.max_attention_height = config.max_attention_height # the maximum image height H that we will use self-attention layers for (if height is too big, the sequence length of H*W = H^2 is too expensive)
+        self.base_channels = config.base_channels # the number of out_channels from the first ResNetBlock
+        self.d = config.d # time/class embedding dimension
+        self.dropout = config.dropout # dropout probability for resnetblocks
+
+        # Encoder/Down portion of the U-Net
+        self.down_blocks = []
+        for i in range(self.num_downsamples):
+            if i == 0:
+                in_channels = self.channels
+                out_channels = self.base_channels
+            else:
+                in_channels = out_channels
+                out_channels = 2*in_channels # hardcoding 2 here since people seem to double channels to compensate for downsampling by factor of 2 and we indeed assumed a factor of 2 when downsampling
+            block = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
+            self.down_blocks.append(block)
+        
+        # The Bottleneck/Bottom portion of the U-Net
+        in_channels = out_channels
+        out_channels = 2*in_channels
+        self.bottleneck_conv = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
+
+        # The Decoder/Up portion of the U-Net
+        self.up_blocks = []
+        for i in range(self.num_downsamples): # we have the same number of upsamples as we do downsamples
+            # TODO TODO TODO FIX ALL THIS DO NOT TRUST THIS AT ALL!!!! YOU FIXED UPSAMPLING TO HALVE THE CHANNELS!!!!!!
+            in_channels = out_channels * 2 # multiplying by 2 because we'll do channel-wise concatenation with the output from the encoder (i.e. "down") portion of the U-Net 
+            out_channels = in_channels // 4 # as we upsample, we halve the number of channels
+            block = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
+            self.up_blocks.append(block)
+        
+
+
+
+
+
     
     def forward(self, x, t, y):
         """
-        `x` has shape (B, 1, 28, 28) --- batch of noise samples which are the same shape as an MNIST image (batch size B)
+        `x` has shape (B, C, H, W) --- batch of noise samples which are the same shape as a batch of images
         `t` has shape (B, 1) --- batch of times which are scalars in [0, 1]
-        `y` has shape (B, 1) --- batch of class labels which are in {0, ..., 10}. Class labels in {0, ..., 9} correspond to MNIST 
-        digits and a class label of 10 corresponds to the empty class label, which is used for classifier-free guidance (CFG)
+        `y` has shape (B, 1) --- batch of class labels which are in {0, ..., num_classes}. Class labels in {0, ..., num_classes-1}
+        correspond to the regular class labels and a class label of num_classes corresponds to the empty class label, which is used for classifier-free guidance (CFG)
 
         Remember that this model, when used in a flow model, is the guided vector field u_t^{theta}(x|y) which induces
         the ODE 
             dx/dt = u_t^{theta}(x|y)
         where theta refers to the model's learned parameters and the vector field is "guided" by the class label y.
         """
-        pass
+
+        B, C, H, W = x.shape
+        if H != self.H_init:
+            raise ValueError(f"{x.shape=}, {H=}, {self.H_init=}")
+        if C != self.channels:
+            raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
+
+        # TODO remember to normalize before attention and to do residual connection with attention
