@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 from dataclasses import dataclass
 import yaml
 import math
@@ -20,7 +20,7 @@ class SinusoidalEmbedding(nn.Module):
         `t` has shape (B, 1) --- batch of times in [0, 1]
         `t` gets mapped to a batch of embeddings of dimension d --- output has shape (B, d)
         """
-        i = torch.arange(self.d // 2, device=t.device()) # shape (d//2)
+        i = torch.arange(self.d // 2, device=t.device) # shape (d//2)
         freqs = 1/self.base ** ((2 * i) / self.d) # shape (d//2)
         angles = freqs * t # (d//2) * (B, 1) --> broadcasts to (B, d//2)
         return torch.cat([angles.sin(), angles.cos()], dim=-1)
@@ -29,10 +29,11 @@ class SinusoidalEmbedding(nn.Module):
 class MLP(nn.Module):
 
     def __init__(self, input_dim, hidden_dim=None, bias=False):
+        super().__init__()
         hidden_dim = hidden_dim if hidden_dim is not None else 4 * input_dim
 
-        W1 = nn.Linear(input_dim, hidden_dim, bias=bias)
-        W2 = nn.Linear(hidden_dim, input_dim, bias=bias)
+        self.W1 = nn.Linear(input_dim, hidden_dim, bias=bias)
+        self.W2 = nn.Linear(hidden_dim, input_dim, bias=bias)
 
     def forward(self, x):
         """
@@ -251,7 +252,7 @@ class ResNetBlock(nn.Module):
         if in_channels == out_channels:
             self.skip_connection = nn.Identity()
         else:
-            self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1) # in this case, the point of the convolution is just to adjust the number of channels so we can add it to the output at the end
+            self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1) # in this case, the point of the convolution is just to adjust the number of channels so we can add it to the output at the end
 
     def forward(self, x, z):
         """
@@ -418,7 +419,7 @@ class UNet(nn.Module):
             if H_curr <= self.max_attention_height:
                 attn = SelfAttention(channels=out_channels, num_heads=config.attention_heads)
             else:
-                attn = None # we only use attention when the spatial dimensions are sufficiently small so that the "sequence length" isn't too long/expensive
+                attn = nn.Identity() # we only use attention when the spatial dimensions are sufficiently small so that the "sequence length" isn't too long/expensive
             downsample = Downsample(channels=out_channels)
 
             self.encoder_resnets.append(resnet)
@@ -434,7 +435,7 @@ class UNet(nn.Module):
         if H_curr <= self.max_attention_height:
             self.bottleneck_attn = SelfAttention(channels=out_channels, num_heads=config.attention_heads)
         else:
-            self.bottleneck_attn = None
+            self.bottleneck_attn = nn.Identity()
         
         # The Decoder/Upward portion of the U-Net
         self.upsamples = nn.ModuleList()
@@ -452,17 +453,13 @@ class UNet(nn.Module):
             if H_curr <= self.max_attention_height:
                 attn = SelfAttention(channels=out_channels, num_heads=config.attention_heads)
             else:
-                attn = None
+                attn = nn.Identity()
             
             self.upsamples.append(upsample)
             self.decoder_resnets.append(resnet)
             self.decoder_attns.append(attn)
         
-
-        # TODO add output conv 1x1
-
-
-
+        self.output_conv = nn.Conv2d(in_channels=out_channels, out_channels=config.channels, kernel_size=1) # Project back to original image channel dim
     
     def forward(self, x, t, y):
         """
@@ -484,29 +481,29 @@ class UNet(nn.Module):
             raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
         
         z = self.time_and_class_embedding(t, y) # shape (B, d)
-        if z.shape[0] != B or z.shape[1] != hfhgd or len(z.shape) != 2:
+        if z.shape[0] != B or len(z.shape) != 2:
             raise ValueError(f"{z.shape=}, {x.shape=}, {t.shape=}, {y.shape=}")
         
         # Encoder/Downward portion of U-Net
         encoder_residuals = []
         for resnet, attn, downsample in zip(self.encoder_resnets, self.encoder_attns, self.downsamples):
-            x = resnet(x)
-            if attn is not None:
-                x = attn(x) # note that normalization and residual connection happens inside the SelfAttention forward pass!
+            x = resnet(x, z)
+            x = attn(x) # Note that normalization and residual connection happens inside the SelfAttention forward pass! sometimes `attn` is just the identity operation, so it is cleanest to do it this way
             encoder_residuals.append(x)
             x = downsample(x)
         
         # Bottleneck/Bottom portion of U-Net
-        x = self.bottleneck_resnet(x)
-        if self.bottleneck_attn is not None:
-            x = self.bottleneck_attn(x)
+        x = self.bottleneck_resnet(x, z)
+        x = self.bottleneck_attn(x)
         
         for upsample, resnet, attn in zip(self.upsamples, self.decoder_resnets, self.decoder_attns):
             x = upsample(x)
-            res = 
-
-
+            r = encoder_residuals.pop()
+            assert x.shape == r.shape, f"{x.shape=}, {r.shape=}"
+            x = torch.cat([x, r], dim=1) # dim=1 to concatenate along the channels dimension
+            x = resnet(x, z)
+            x = attn(x)
         
-
-        # TODO remember to normalize before attention and to do residual connection with attention
-
+        x = rmsnorm(x)
+        x = F.relu(x).square()
+        return self.output_conv(x)
