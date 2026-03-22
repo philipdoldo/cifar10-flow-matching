@@ -203,7 +203,7 @@ class Upsample(nn.Module):
 
     def __init__(self, channels):
         """
-        `channels` is an integer which is the number of input channels (and output channels)
+        `channels` is an integer which is the number of input channels
         """
         super().__init__()
         self.channels = channels
@@ -273,7 +273,7 @@ class ResNetBlock(nn.Module):
         z = z[:, :, None, None] # (B, out_channels, 1, 1)
 
         # Add context from time/class embeddings 
-        h = h + z               # (B, out_channels, H, W)
+        h = h + z                # (B, out_channels, H, W)
 
         # Second Conv Block: 
         h = rmsnorm(h)          # (B, out_channels, H, W)
@@ -300,7 +300,7 @@ class SelfAttention(nn.Module):
     required to do a regular linear layer while still returning the correct output shape
     - I won't use RoPE for now. Seems like ViTs have used 2D RoPE before? maybe test that later
     """
-    def __init__(self, channels:int, num_heads: int):
+    def __init__(self, channels: int, num_heads: int):
         super().__init__()
 
         self.channels = channels
@@ -321,8 +321,9 @@ class SelfAttention(nn.Module):
             raise ValueError(f"{C=}, {self.num_heads=}, {C/self.num_heads=} we need our head_size to be an integer")
         head_size = C // self.num_heads
 
+        h = rmsnorm(x) # (B, C, H, W) --- putting the normalization inside this block to make UNet forward cleaner?
 
-        qkv = self.qkv_conv(x) # (B, 3*C, H, W)
+        qkv = self.qkv_conv(h) # (B, 3*C, H, W)
 
         qkv = qkv.view(B, 3, self.num_heads, head_size, H * W)  # (B, 3, num_heads, head_size, H*W)
         qkv = qkv.permute(1, 0, 2, 4, 3)  # (3, B, num_heads, H*W, head_size)
@@ -343,11 +344,11 @@ class SelfAttention(nn.Module):
 
         y = y.transpose(2, 3) # (B, num_heads, head_dim, H*W)
         y = y.contiguous().view(B, C, H, W)
-        return 
+        return self.output_conv(y) + x # residual inside block to make UNet forward cleaner?
 
 
 @dataclass
-class UNetConfig:
+class UNetConfig: # TODO actually write this config class
     in_channels: int = 3
     model_channels: int = 128
     channel_multipliers: tuple = (1, 2, 4, 8)
@@ -396,34 +397,69 @@ class UNet(nn.Module):
         self.d = config.d # time/class embedding dimension
         self.dropout = config.dropout # dropout probability for resnetblocks
 
-        # Encoder/Down portion of the U-Net
-        self.down_blocks = []
+        self.time_and_class_embedding = TimeAndClassEmbedding(self, config.d, hidden_dim=config.time_and_class_mlp_hidden_dim, num_classes=config.num_classes, base=config.sinusoidal_base)
+
+        # Encoder/Downward portion of the U-Net
+        self.encoder_resnets = nn.ModuleList()
+        self.encoder_attns = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
         for i in range(self.num_downsamples):
             if i == 0:
                 in_channels = self.channels
                 out_channels = self.base_channels
+                H_curr = self.H_init
             else:
                 in_channels = out_channels
-                out_channels = 2*in_channels # hardcoding 2 here since people seem to double channels to compensate for downsampling by factor of 2 and we indeed assumed a factor of 2 when downsampling
-            block = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
-            self.down_blocks.append(block)
+                out_channels = 2*in_channels # hardcoding 2 here since people seem to double channels to compensate for downsampling by factor of 2 and we indeed assumed a factor of 2 in the Downsample class definition
+                H_curr = H_curr // 2
+                assert H_curr >= self.H_min, f"{H_curr=}, {self.H_min=}, {i=}"
+
+            resnet = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
+            if H_curr <= self.max_attention_height:
+                attn = SelfAttention(channels=out_channels, num_heads=config.attention_heads)
+            else:
+                attn = None # we only use attention when the spatial dimensions are sufficiently small so that the "sequence length" isn't too long/expensive
+            downsample = Downsample(channels=out_channels)
+
+            self.encoder_resnets.append(resnet)
+            self.encoder_attns.append(attn)
+            self.downsamples.append(downsample)
         
         # The Bottleneck/Bottom portion of the U-Net
         in_channels = out_channels
         out_channels = 2*in_channels
-        self.bottleneck_conv = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
-
-        # The Decoder/Up portion of the U-Net
-        self.up_blocks = []
+        H_curr = H_curr // 2
+        assert H_curr >= self.H_min, f"{H_curr=}, {self.H_min=} (bottleneck)"
+        self.bottleneck_resnet = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
+        if H_curr <= self.max_attention_height:
+            self.bottleneck_attn = SelfAttention(channels=out_channels, num_heads=config.attention_heads)
+        else:
+            self.bottleneck_attn = None
+        
+        # The Decoder/Upward portion of the U-Net
+        self.upsamples = nn.ModuleList()
+        self.decoder_resnets = nn.ModuleList()
+        self.decoder_attns = nn.ModuleList()
         for i in range(self.num_downsamples): # we have the same number of upsamples as we do downsamples
-            # TODO TODO TODO FIX ALL THIS DO NOT TRUST THIS AT ALL!!!! YOU FIXED UPSAMPLING TO HALVE THE CHANNELS!!!!!!
-            in_channels = out_channels * 2 # multiplying by 2 because we'll do channel-wise concatenation with the output from the encoder (i.e. "down") portion of the U-Net 
-            out_channels = in_channels // 4 # as we upsample, we halve the number of channels
-            block = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
-            self.up_blocks.append(block)
+            
+            # the number of channels entering the upsample is equal to the number of channels that will enter the resnet following the upsample because the upsample halves the channels but then the concatenation from the residual connection doubles the channels
+            in_channels = out_channels # for both upsample and resnet
+            out_channels = in_channels // 2 # resnets in the decoder should halve the channels
+            H_curr = H_curr * 2 # height after upsampling, remains unchanged from resnet so we can use it to determine whether or not to add attention after the resnet before upsampling again
+            
+            upsample = Upsample(channels=in_channels)
+            resnet = ResNetBlock(in_channels=in_channels, out_channels=out_channels, d=self.d, dropout=self.dropout)
+            if H_curr <= self.max_attention_height:
+                attn = SelfAttention(channels=out_channels, num_heads=config.attention_heads)
+            else:
+                attn = None
+            
+            self.upsamples.append(upsample)
+            self.decoder_resnets.append(resnet)
+            self.decoder_attns.append(attn)
         
 
-
+        # TODO add output conv 1x1
 
 
 
@@ -446,5 +482,31 @@ class UNet(nn.Module):
             raise ValueError(f"{x.shape=}, {H=}, {self.H_init=}")
         if C != self.channels:
             raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
+        
+        z = self.time_and_class_embedding(t, y) # shape (B, d)
+        if z.shape[0] != B or z.shape[1] != hfhgd or len(z.shape) != 2:
+            raise ValueError(f"{z.shape=}, {x.shape=}, {t.shape=}, {y.shape=}")
+        
+        # Encoder/Downward portion of U-Net
+        encoder_residuals = []
+        for resnet, attn, downsample in zip(self.encoder_resnets, self.encoder_attns, self.downsamples):
+            x = resnet(x)
+            if attn is not None:
+                x = attn(x) # note that normalization and residual connection happens inside the SelfAttention forward pass!
+            encoder_residuals.append(x)
+            x = downsample(x)
+        
+        # Bottleneck/Bottom portion of U-Net
+        x = self.bottleneck_resnet(x)
+        if self.bottleneck_attn is not None:
+            x = self.bottleneck_attn(x)
+        
+        for upsample, resnet, attn in zip(self.upsamples, self.decoder_resnets, self.decoder_attns):
+            x = upsample(x)
+            res = 
+
+
+        
 
         # TODO remember to normalize before attention and to do residual connection with attention
+
