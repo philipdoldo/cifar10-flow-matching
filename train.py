@@ -78,9 +78,90 @@ where our model's input is a simple convex combination between some data point z
 our model's output effectively predict the difference between the true data point z and the noise epsilon.
 
 - That's great, this training objective would let us sample novel points from p_{data}, but what if we specifically want to generate a picture
-of a dog rather than just any arbitrary picture? We'll use classifier-free guidance (CFG) TODO TODO TODO
-TODO CFG!!!!!!!!
+of a dog rather than just any arbitrary picture? We'll use classifier-free guidance (CFG).
 
-FLOW MATCHING TRAINING RECIPE (Gaussian probability paths with linear noise schedules): TODO CFG
+- CFG is really just a heuristic (can somewhat motivate it using Gaussian paths and relating the vector field to the score function and doing some Bayes stuff)
+Basically, in practice people observed that doing inference with the so-called classifier-free guided vector field
+    tilde{u}_t(x|y) = (1-w)*u_t^{target}(x) + w*u_t^{target}(x|y)
+empirically gives higher-quality images for some w > 1 (e.g. w=4) where we can view u_t^{target}(x) as u_t^{target}(x|null) where null can be thought of as the
+"empty" class label --- this null class label lets us train just a single neural network instead of a separate one for u_t^{target}(x) and u_t^{target}(x|y).
+
+- When training our model with CFG, all that changes is that instead of sampling z ~ p_{data} we now treat our data distribution as a joint distribution over data
+points z and class labels y, so we sample (z, y) ~ p_{data} where in practice we replace y with the null class with probability eta > 0 to effectively make it
+equivalent to sampling from a joint over all data points and extended class labels (i.e. including the null class label).
+
+- The w > 1 weight from CFG doesn't come into play at all during training, it is used during inference where we simply drop in the classifier-free guided vector field
+tilde{u}_t(x|y) = (1-w)*u_t^{target}(x|null) + w*u_t^{target}(x|y) into our ODE and numerically integrate it. Note how this technically doubles the number of function
+evaluations that we have to perform during each step of inference (though I've never seen anyone explicitly point this out, I feel like it is an important detail to be
+aware of --- better image quality in the same number of numerical integration steps isn't really a fair comparison if we double the number of function evaluations). Claude
+suggested some arxiv paper that claims that it could be good to use the CFG vector field for the first 30-50% of numerical integration steps and then just fall back on
+to w=1 (when w=1, the null class term goes to 0 and you only do one function evaluation each step instead of two) for the remainder of the steps to reduce the number of
+function evaluations.
+
+FLOW MATCHING w/ CFG TRAINING RECIPE (Gaussian probability paths with linear noise schedules):
+
+Start with: 
+    - dataset of labeled images (z, y) ~ p_{data}
+    - neural network u_t^{theta}
+
+For each training step:
+    1. Sample a batch (z, y) of data from your dataloader where z has shape (B, d) and y has shape (B,) where B is the batch size, z is in R^d and y is a scalar class label
+    2. Sample a batch of times t where t has shape (B,) and all entries of t are i.i.d. sampled from Unif([0,1])
+    3. Sample a batch of noises epsilon where epsilon has shape (B, d) where all entries (index by batch) are i.i.d. sampled from N(0, I_d)
+    4. Set x = alpha_t * z + beta_t * epsilon, e.g. alpha_t = t, beta_t = (1-t) --- let A_t := d/dt(alpha_t) and B_t := d/dt(beta_t)
+    5. With probability eta, change a given batch's class label to the null class label
+    6. Compute loss (1/B) * || u_t^{theta}(x|y) - (A_t * z + B_t * epsilon) ||_2^2    <-- batch approximation of expected value
+    7. Take gradient and update model parameters with optimizer of choice
+
+Can do gradient accumulation easily if desired
 
 """
+
+import torch
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+batch_size = 128
+eta = 1/11
+null_label = 10
+# TODO define/load config, define model
+device = "cuda" if torch.cuda.is_available() else "cpu" ### TODO add DDP
+
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # maps [0,1] -> [-1,1] since noise is N(0, I_d)
+])
+
+# Set random seed for when we shuffle our data
+generator = torch.Generator()
+generator.manual_seed(42) 
+
+dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, generator=generator)
+
+
+for z, y in train_loader:
+    # z has shape (B, 3, 32, 32)
+    # y has shape (B,)
+    B, C, H, W = z.shape
+    assert B == batch_size, f"{B=}, {batch_size=}"
+
+    z = z.to(device)
+    y = y.to(device)
+
+    # With probability eta, change class label to the null class label
+    mask = torch.rand(B, device=device) < eta
+    y[mask] = null_label
+
+    t = torch.rand(batch_size, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
+    epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
+
+    # Using alpha_t = t and beta_t = 1-t
+    x = t * z + (1-t) * epsilon # (B, C, H, W)
+    target = z - epsilon
+    loss = (model(x=x, t=t, y=y) - target).square().mean()
+    loss.backward()
+
+    # TODO define optimizer to step
+    # TODO logging, checkpointing, DDP, grad accum, eval (val loss, FID, sample image grids w/ fixed noise inputs? have to remember to undo the transformation to visualize properly!!! )
