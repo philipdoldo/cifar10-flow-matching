@@ -115,17 +115,100 @@ For each training step:
 
 Can do gradient accumulation easily if desired
 
+
+I'm working on a small scale so I'm probably not going to bother with sharded optimizer states, fp16 (V100s), etc., will just get a basic
+proof of concept just to learn continuous diffusion basics and then I'll move on to other projects
 """
 
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import argparse
+import os
+from model import UNet, UNetConfig
+import math
 
+def sample(model, batch_size, num_steps, class_labels, device, cfg_weight=4, null_class_label=10):
+
+    model.eval()
+    with torch.no_grad():
+
+        # TODO use forward euler 
+
+        null_class_labels = null_class_label * torch.ones(batch_size).to(device) # shape (batch_size,)
+
+        u = (1-cfg_weight) * model(x=x, y=null_class_labels, t=t) + cfg_weight * model(x=x, y=class_labels, t=t)
+
+    return images  # (batch_size, 3, 32, 32)
+
+def print0(s="",**kwargs):
+    ddp_rank = int(os.environ.get('RANK', 0))
+    if ddp_rank == 0:
+        print(s, **kwargs)
+
+effective_batch_size = 512
+grad_accum_steps = 1
+training_steps = 100000
 batch_size = 128
 eta = 1/11
 null_label = 10
+val_loss_interval = 500
+checkpoint_interval = 500
+image_sample_interval = 500
+num_image_samples = 10
+
+
+
+warmup_steps = 1000
+max_lr = 3e-4
+min_lr = max_lr / 10
+lr_decay_steps = training_steps - warmup_steps
+def get_lr(it):
+    # 1) linear warmup for warmup_steps steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / (warmup_steps + 1)
+    # 2) if it > lr_decay_steps, return min learning rate
+    if it > lr_decay_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (lr_decay_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
 # TODO define/load config, define model
-device = "cuda" if torch.cuda.is_available() else "cpu" ### TODO add DDP
+
+model_config = UNetConfig()
+model = UNet(model_config)
+
+
+use_ddp = int(os.environ.get('RANK', -1)) != -1
+
+if use_ddp:
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = dist.get_world_size()
+
+    assert ddp_rank == dist.get_rank(), f"{ddp_rank=}, {dist.get_rank()=}"
+    assert ddp_local_rank == dist.local_rank(), f"{ddp_local_rank=}, {dist.local_rank()=}"
+
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    world_size = 1
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+model = model.to(device)
+if use_ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
 
 transform = transforms.Compose([
@@ -137,18 +220,93 @@ transform = transforms.Compose([
 generator = torch.Generator()
 generator.manual_seed(42) 
 
-dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, generator=generator)
+train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=42)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4, pin_memory=True, generator=generator)
+
+val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+val_sampler = DistributedSampler(val_dataset, shuffle=False)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
 
 
-for z, y in train_loader:
-    # z has shape (B, 3, 32, 32)
-    # y has shape (B,)
+### I'm just going to do everything in fp32 for now... can switch to fp16 on V100s after if I want
+# # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
+# scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+# if scaler is not None:
+#     print0("GradScaler enabled for fp16 training")
+
+##### predefining noise to sample from periodically so that we use the same initial noise for all samples
+torch.manual_seed(42)
+fixed_noise = torch.randn(num_image_samples, 3, 32, 32, device=device)
+fixed_labels = torch.arange(num_image_samples, device=device) % 10  # one of each class, cycling if num_image_samples > 10
+
+
+epoch = 0
+train_iter = iter(train_loader)
+for step in range(training_steps):
+
+    if step % val_loss_interval == 0 or step == training_steps - 1:
+        model.eval()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            num_val_batches = 0
+            for z_val, y_val in val_dataloader:
+                B, C, H, W = z_val.shape
+                z_val = z_val.to(device)
+                y_val = y_val.to(device)
+                # With probability eta, change class label to the null class label
+                mask_val = torch.rand(B, device=device) < eta
+                y_val[mask_val] = null_label
+                t_val = torch.rand(B, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
+                epsilon_val = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
+                
+                x_val = t_val * z_val + (1-t_val) * epsilon_val # (B, C, H, W)
+                target_val = z_val - epsilon_val
+
+                val_loss = (model(x=x_val, t=t_val, y=y_val) - target_val).square().mean()
+
+                val_loss_accum += val_loss.item()
+                num_val_batches += 1
+            avg_val_loss = val_loss_accum / num_val_batches
+        model.train()
+        print0(f"step {step} | val loss {avg_val_loss:.4f}")
+    
+    if ddp_rank == 0 and (step % image_sample_interval == 0 or step == training_steps - 1):
+        
+        model.eval()
+        images = sample(model, ...) # TODO
+
+        # undo image transformation!!!
+        # save images somewhere
+
+        model.train()
+
+    if ddp_rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
+        checkpoint = {
+            'step': step,
+            'model': model.module.state_dict() if use_ddp else model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch,
+        }
+        torch.save(checkpoint, f'checkpoint_step{step}.pt')
+
+
+    train_sampler.set_epoch(epoch) # ensures different shuffle each epoch
+
+    # Get next batch, restart dataloader if epoch completed
+    try:
+        z, y = next(train_iter)
+    except StopIteration:
+        epoch += 1
+        train_sampler.set_epoch(epoch) # reshuffles dataloader at start of new epoch
+        train_iter = iter(train_loader)
+        z, y = next(train_iter)
+
     B, C, H, W = z.shape
     assert B == batch_size, f"{B=}, {batch_size=}"
 
-    z = z.to(device)
-    y = y.to(device)
+    z = z.to(device) # (B, 3, 32, 32)
+    y = y.to(device) # (B,)
 
     # With probability eta, change class label to the null class label
     mask = torch.rand(B, device=device) < eta
@@ -156,12 +314,45 @@ for z, y in train_loader:
 
     t = torch.rand(batch_size, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
     epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
+    
+    for micro_step in range(grad_accum_steps):
+        # Using alpha_t = t and beta_t = 1-t
+        x = t * z + (1-t) * epsilon # (B, C, H, W)
+        target = z - epsilon
 
-    # Using alpha_t = t and beta_t = 1-t
-    x = t * z + (1-t) * epsilon # (B, C, H, W)
-    target = z - epsilon
-    loss = (model(x=x, t=t, y=y) - target).square().mean()
-    loss.backward()
+        assert effective_batch_size == (world_size * B * grad_accum_steps)
 
-    # TODO define optimizer to step
-    # TODO logging, checkpointing, DDP, grad accum, eval (val loss, FID, sample image grids w/ fixed noise inputs? have to remember to undo the transformation to visualize properly!!! )
+        # Effective batch size is per_gpu_batch_size * num_gpus * grad_accum_steps, when we call loss.backward() the local gradients
+        # are averaged over all ranks, the gradient on the existing rank has per_gpu_batch_size * num_gpus in the denominator and then
+        # averaging all of these local averages over all ranks will give us the correct final denominator in our effective batch expectation
+        loss = (model(x=x, t=t, y=y) - target).square().mean() / grad_accum_steps # .mean() averages over all dimensions, including batches! 
+        loss.backward()
+
+        ##### LOAD DATA FOR NEXT ITERATION -- would probably be cleaner to put the times and noise and null label stuff all inside a dataloader class, but this is just a quick and dirty script so I'm not worrying about it
+        try:
+            z, y = next(train_iter)
+        except StopIteration:
+            epoch += 1
+            train_sampler.set_epoch(epoch) # reshuffles dataloader at start of new epoch
+            train_iter = iter(train_loader)
+            z, y = next(train_iter)
+        z = z.to(device) # (B, 3, 32, 32)
+        y = y.to(device) # (B,)
+
+        # With probability eta, change class label to the null class label
+        mask = torch.rand(B, device=device) < eta
+        y[mask] = null_label
+
+        t = torch.rand(batch_size, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
+        epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
+        
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = get_lr(step)
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
+    
+
+        # TODO logging, checkpointing, DDP, grad accum, eval (val loss, FID, sample image grids w/ fixed noise inputs? have to remember to undo the transformation to visualize properly!!! )
+
+if use_ddp:
+    dist.destroy_process_group()

@@ -352,7 +352,7 @@ class SelfAttention(nn.Module):
 
 
 @dataclass
-class UNetConfig: # TODO actually write this config class
+class UNetConfig:
     channels: int = 3
     initial_image_height: int = 32
     min_image_height: int = 4 # the smallest we allow our image height to get from downsampling
