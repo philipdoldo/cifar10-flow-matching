@@ -67,13 +67,9 @@ class TimeAndClassEmbedding(nn.Module):
         """
         if t.shape != y.shape or len(t.shape) != 1:
             raise ValueError(f"{t.shape=}, {y.shape=}")
-        print(f"{t.shape=}, {y.shape=}   ----")
         class_emb = self.class_embedding(y) # shape (B, d)
-        print(f"{class_emb.shape=}")
         time_emb = self.time_embedding(t) # shape (B, d)
-        print(f"{time_emb.shape=}")
         embeddings = self.mlp(class_emb + time_emb) # shape (B, d)
-        print(f"{embeddings.shape=}")
         return embeddings # shape (B, d)
 
 
@@ -369,9 +365,9 @@ class UNetConfig:
     attention_heads: int = 4
 
     @classmethod
-    def from_yaml(cls, path: str) -> "UNetConfig":
-        with open(path) as f:
-            return cls(**yaml.safe_load(f))
+    def from_dict(cls, d: dict) -> "UNetConfig":
+        # treat whole dict as UNetConfig
+        return cls(**d)
 
 def is_power_of_2(n: int):
     """

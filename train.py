@@ -121,6 +121,7 @@ proof of concept just to learn continuous diffusion basics and then I'll move on
 """
 
 import torch
+import torchvision
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -132,19 +133,45 @@ from model import UNet, UNetConfig
 import math
 from datetime import datetime
 import time
+import yaml
 
-def sample(model, batch_size, num_steps, class_labels, device, cfg_weight=4, null_class_label=10):
+def sample(model, batch_size, class_labels, device, num_steps=100, image_shape=(3, 32, 32), cfg_weight=4, null_class_label=10, initial_noise=None):
+    """
+    Since we are integrating from 0 to 1, the step size is 1/num_steps
 
+    dx/dt = u(x, t), x(0) = x_0 ~ N(0, I_d)
+
+    just do forward euler with the initial condition sampled from the noise distribution
+    x_0 ~ N(0, I_d)
+    x_{n+1} = x_n + step_size * u(x_n, t_n)
+    """
+    class_labels = class_labels.to(device)
     model.eval()
     with torch.no_grad():
+        C, H, W = image_shape
 
-        # TODO use forward euler 
+        if initial_noise is None:
+            # during training, we don't want to use this because we want the same initial noise
+            x = torch.randn(batch_size, C, H, W, device=device) # initial condition
+        else:
+            x = initial_noise
+            if x.shape != (batch_size, C, H, W):
+                raise ValueError(f"{x.shape=}, {initial_noise.shape=}, {batch_size=}, {C=}, {H=}, {W=}, {image_shape=}")
+        t = torch.zeros(batch_size, device=device) # inital time is 0 for each batch index
+        step_size = 1/num_steps
 
-        null_class_labels = null_class_label * torch.ones(batch_size).to(device) # shape (batch_size,)
+        for _ in range(num_steps):
 
-        u = (1-cfg_weight) * model(x=x, y=null_class_labels, t=t) + cfg_weight * model(x=x, y=class_labels, t=t)
+            if cfg_weight == 1: # in this case, we only need 1 function eval per step instead of 2
+                u = model(x=x, y=class_labels, t=t) 
+            else:
+                null_class_labels = null_class_labels = torch.full((batch_size,), null_class_label, dtype=torch.long, device=device)# shape (batch_size,)
+                u = (1-cfg_weight) * model(x=x, y=null_class_labels, t=t) + cfg_weight * model(x=x, y=class_labels, t=t)
+            
+            x = x + step_size * u
+            t = t + step_size
 
-    return images  # (batch_size, 3, 32, 32)
+    return x # (batch_size, C, H, W)
 
 def print0(s="", **kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
@@ -168,223 +195,232 @@ def create_log_dir(parent_dir):
         timestamp = datetime.now().strftime("%m-%d-%Y-%Hh%Mm%Ss")
         log_dir = os.path.join(parent_dir, f"{timestamp}")
         os.makedirs(log_dir, exist_ok=True)
+        checkpoint_dir = os.path.join(log_dir, "checkpoints") # store checkpoints here
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        sample_dir = os.path.join(log_dir, "samples") # store image samples made during training here
+        os.makedirs(sample_dir, exist_ok=True)
     return log_dir
 
-effective_batch_size = 1024
-grad_accum_steps = 1
-training_steps = 100000
-batch_size = 128
-eta = 1/11
-null_label = 10
-val_loss_interval = 50
-checkpoint_interval = 10000
-image_sample_interval = 500
-num_image_samples = 10
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    args = parser.parse_args()
 
-save_dir = "/mnt/data_r60_1/adv_robust_project/mnist-flow-model/experiments"
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
 
-log_dir = create_log_dir(save_dir)
+    effective_batch_size = config["effective_batch_size"]
+    batch_size = config["batch_size"]
+    grad_accum_steps = config["grad_accum_steps"]
+    training_steps = config["training_steps"]
+    eta = config["eta"]
+    null_label = config["null_label"]
+    val_loss_interval = config["val_loss_interval"]
+    checkpoint_interval = config["checkpoint_interval"]
+    image_sample_interval = config["image_sample_interval"]
+    num_image_samples = config.get("num_image_samples", 10)
+    cfg_weight = config.get("cfg_weight", 4)
+    forward_euler_steps = config.get("forward_euler_steps", 100)
+    save_dir = config["save_dir"]
 
-warmup_steps = 1000
-max_lr = 3e-4
-min_lr = max_lr / 10
-lr_decay_steps = training_steps - warmup_steps
-def get_lr(it):
-    # 1) linear warmup for warmup_steps steps
-    if it < warmup_steps:
-        return max_lr * (it + 1) / (warmup_steps + 1)
-    # 2) if it > lr_decay_steps, return min learning rate
-    if it > lr_decay_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (lr_decay_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (max_lr - min_lr)
-# TODO define/load config, define model
+    log_dir = create_log_dir(save_dir)
 
-model_config = UNetConfig()
-model = UNet(model_config)
+    warmup_steps = config["warmup_steps"]
+    max_lr = config["max_lr"]
+    min_lr = config.get("min_lr", max_lr/10)
+    lr_decay_steps = training_steps - warmup_steps
+    def get_lr(it):
+        # 1) linear warmup for warmup_steps steps
+        if it < warmup_steps:
+            return max_lr * (it + 1) / (warmup_steps + 1)
+        # 2) if it > lr_decay_steps, return min learning rate
+        if it > lr_decay_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (lr_decay_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+        return min_lr + coeff * (max_lr - min_lr)
+
+    model_config = UNetConfig.from_dict(config["model"])
+    model = UNet(model_config)
+
+    ddp = int(os.environ.get('RANK', -1)) != -1
+
+    if ddp:
+        dist.init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = dist.get_world_size()
+
+        assert ddp_rank == dist.get_rank(), f"{ddp_rank=}, {dist.get_rank()=}"
+
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        print(f"{ddp_rank=}, {ddp_local_rank=}, {world_size=}, {device=}")
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        world_size = 1
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"{ddp_rank=}, {ddp_local_rank=}, {world_size=}, {device=}")
+
+    # sanity check inputs
+    if world_size * batch_size * grad_accum_steps != effective_batch_size:
+        raise ValueError(f"{effective_batch_size=}, {world_size=}, {batch_size=}, {grad_accum_steps=}, {world_size*batch_size*grad_accum_steps=}")
+
+    # Initialize log file
+    log_file = f"{log_dir}/log.txt"
+    if ddp_rank == 0:
+        with open(log_file, 'w') as f:
+            f.write("") # initialize log file
+
+        with open(os.path.join(log_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f) # save copy of yaml in log directory
+
+    # Write basic info at start of log file (config, GPU info, etc.)
+    write0("Config:\n", log_file=log_file)
+    for key, value in config.items():
+        if isinstance(value, dict):
+            write0(f"  {key}:\n", log_file=log_file)
+            for subkey, subvalue in value.items():
+                write0(f"    {subkey}: {subvalue}\n", log_file=log_file)
+        else:
+            write0(f"  {key}: {value}\n", log_file=log_file)
+    write0(f"Using {world_size} GPU(s)\n", log_file=log_file)
+    write0(f"GPU Type: {torch.cuda.get_device_name()}\n", log_file=log_file)
+
+    model = model.to(device)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+
+    num_params = sum(p.numel() for p in model.parameters())
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
+
+    optimizer = torch.optim.AdamW(model.parameters())
+    # TODO could add weight decay, grad_clip_norm, etc if desired
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # maps [0,1] -> [-1,1] since noise is N(0, I_d)
+    ])
+
+    # Set random seed for when we shuffle our data
+    generator = torch.Generator()
+    generator.manual_seed(42) 
+
+    train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=42)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4, pin_memory=True, generator=generator)
+
+    val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
 
 
-ddp = int(os.environ.get('RANK', -1)) != -1
+    ### I'm just going to do everything in fp32 for now... can switch to fp16 on V100s after if I want
+    # # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
+    # scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+    # if scaler is not None:
+    #     print0("GradScaler enabled for fp16 training")
 
-if ddp:
-    dist.init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    world_size = dist.get_world_size()
-
-    assert ddp_rank == dist.get_rank(), f"{ddp_rank=}, {dist.get_rank()=}"
-    ##assert ddp_local_rank == dist.local_rank(), f"{ddp_local_rank=}, {dist.local_rank()=}"
-
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    print(f"{ddp_rank=}, {ddp_local_rank=}, {world_size=}, {device=}")
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    world_size = 1
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"{ddp_rank=}, {ddp_local_rank=}, {world_size=}, {device=}")
+    ##### predefining noise to sample from periodically so that we use the same initial noise for all samples
+    torch.manual_seed(42)
+    fixed_noise = torch.randn(num_image_samples, 3, 32, 32, device=device)
+    fixed_labels = torch.arange(num_image_samples, device=device) % 10  # one of each class, cycling if num_image_samples > 10
 
 
-if world_size * batch_size * grad_accum_steps != effective_batch_size:
-    raise ValueError(f"{effective_batch_size=}, {world_size=}, {batch_size=}, {grad_accum_steps=}, {world_size*batch_size*grad_accum_steps=}")
+    epoch = 0
+    train_iter = iter(train_loader)
+    for step in range(training_steps):
 
-# Initialize log file
-log_file = f"{log_dir}/log.txt"
-if ddp_rank == 0:
-    with open(log_file, 'w') as f:
-        f.write("")
+        # COMPUTE VALIDATION LOSS ON CIFAR10 TEST SET
+        if step % val_loss_interval == 0 or step == training_steps - 1:
+            torch.cuda.synchronize()
+            t0 = time.time()
+            model.eval()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                num_val_batches = 0
+                for z_val, y_val in val_dataloader:
+                    B, C, H, W = z_val.shape
+                    z_val = z_val.to(device)
+                    y_val = y_val.to(device)
+                    # With probability eta, change class label to the null class label
+                    mask_val = torch.rand(B, device=device) < eta
+                    y_val[mask_val] = null_label
+                    t_val = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
+                    epsilon_val = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
+                    
+                    x_val = t_val.view(B, 1, 1, 1) * z_val + (1-t_val.view(B, 1, 1, 1)) * epsilon_val # (B, C, H, W)
+                    target_val = z_val - epsilon_val
 
-write0(f"Using {world_size} GPU(s)\n", log_file=log_file)
-write0(f"GPU Type: {torch.cuda.get_device_name()}\n", log_file=log_file)
+                    val_loss = (model(x=x_val, t=t_val, y=y_val) - target_val).square().mean()
 
-model = model.to(device)
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-num_params = sum(p.numel() for p in model.parameters())
-num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # maps [0,1] -> [-1,1] since noise is N(0, I_d)
-])
-
-# Set random seed for when we shuffle our data
-generator = torch.Generator()
-generator.manual_seed(42) 
-
-train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=42)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4, pin_memory=True, generator=generator)
-
-val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-val_sampler = DistributedSampler(val_dataset, shuffle=False)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
-
-
-### I'm just going to do everything in fp32 for now... can switch to fp16 on V100s after if I want
-# # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
-# scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
-# if scaler is not None:
-#     print0("GradScaler enabled for fp16 training")
-
-##### predefining noise to sample from periodically so that we use the same initial noise for all samples
-torch.manual_seed(42)
-fixed_noise = torch.randn(num_image_samples, 3, 32, 32, device=device)
-fixed_labels = torch.arange(num_image_samples, device=device) % 10  # one of each class, cycling if num_image_samples > 10
-
-
-epoch = 0
-train_iter = iter(train_loader)
-for step in range(training_steps):
-
-    if step % val_loss_interval == 0 or step == training_steps - 1:
-        torch.cuda.synchronize()
-        t0 = time.time()
-        model.eval()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            num_val_batches = 0
-            for z_val, y_val in val_dataloader:
-                B, C, H, W = z_val.shape
-                z_val = z_val.to(device)
-                y_val = y_val.to(device)
-                # With probability eta, change class label to the null class label
-                mask_val = torch.rand(B, device=device) < eta
-                y_val[mask_val] = null_label
-                t_val = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
-                epsilon_val = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
-                
-                x_val = t_val.view(B, 1, 1, 1) * z_val + (1-t_val.view(B, 1, 1, 1)) * epsilon_val # (B, C, H, W)
-                target_val = z_val - epsilon_val
-
-                val_loss = (model(x=x_val, t=t_val, y=y_val) - target_val).square().mean()
-
-                val_loss_accum += val_loss.item()
-                num_val_batches += 1
-            avg_val_loss = val_loss_accum / num_val_batches
-        model.train()
-        torch.cuda.synchronize()
-        t1 = time.time()
-        write0(f"step {step} | val loss {avg_val_loss:.4f} | time {t1-t0:.4f}s\n", log_file=log_file)
-    
-    if False and ddp_rank == 0 and (step % image_sample_interval == 0 or step == training_steps - 1):
+                    val_loss_accum += val_loss.item()
+                    num_val_batches += 1
+                if ddp:
+                    val_loss_tensor = torch.tensor(val_loss_accum / num_val_batches, device=device)
+                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG) # communicate val loss from other ranks
+                    avg_val_loss = val_loss_tensor.item()
+                else:
+                    avg_val_loss = val_loss_accum / num_val_batches # last batch being smaller technically biases results a bit since it gets same weight as other batches, but not a big deal
+            model.train()
+            torch.cuda.synchronize()
+            t1 = time.time()
+            write0(f"step {step}{' '*(8 - len(str(step)))}val loss {avg_val_loss:.4f}    time {t1-t0:.4f}s\n", log_file=log_file)
         
-        model.eval()
-        images = sample(model, ...) # TODO
+        # SAMPLE IMAGES AND SAVE THEM
+        if ddp_rank == 0 and (step % image_sample_interval == 0 or step == training_steps - 1):
+            
+            torch.cuda.synchronize()
+            t0 = time.time()
+            model.eval()
 
-        # undo image transformation!!!
-        # save images somewhere
+            images = sample(
+                model=model, 
+                batch_size=num_image_samples, 
+                class_labels=fixed_labels, 
+                device=device, 
+                num_steps=forward_euler_steps,
+                image_shape=(3, 32, 32), # hardcoded for cifar10
+                cfg_weight=cfg_weight,
+                null_class_label=null_label
+                )
 
-        model.train()
+            images = (images + 1) / 2  # unnormalize [-1,1] -> [0,1]
+            images = images.clamp(0, 1)
+            grid = torchvision.utils.make_grid(images, nrow=5) # hardcoding to 5 rows since defaulting to 10 total images
+            torchvision.utils.save_image(grid, os.path.join(log_dir, f"samples/samples_step{step}.png"))
 
-    if ddp_rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
+            model.train()
+            torch.cuda.synchronize()
+            t1 = time.time()
+            write0(f"Step {step}: {num_image_samples} images generated in {t1-t0:.2f}s ({forward_euler_steps=}, {cfg_weight=})\n", log_file=log_file)
+
+        # SAVE CHECKPOINTS
+        if ddp_rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            checkpoint = {
+                'step': step,
+                'model': model.module.state_dict() if ddp else model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+            }
+            checkpoint_path = os.path.join(log_dir, f'checkpoints/checkpoint_step{step}.pt')
+            torch.save(checkpoint, checkpoint_path)
+            torch.cuda.synchronize()
+            t1 = time.time()
+            write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
+
+
+        train_sampler.set_epoch(epoch) # ensures different shuffle each epoch
+
         torch.cuda.synchronize()
         t0 = time.time()
-        checkpoint = {
-            'step': step,
-            'model': model.module.state_dict() if ddp else model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-        }
-        checkpoint_path = os.path.join(log_dir, f'checkpoint_step{step}.pt')
-        torch.save(checkpoint, checkpoint_path)
-        torch.cuda.synchronize()
-        t1 = time.time()
-        write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
-
-
-    train_sampler.set_epoch(epoch) # ensures different shuffle each epoch
-
-    torch.cuda.synchronize()
-    t0 = time.time()
-    # Get next batch, restart dataloader if epoch completed
-    try:
-        z, y = next(train_iter)
-    except StopIteration:
-        epoch += 1
-        train_sampler.set_epoch(epoch) # reshuffles dataloader at start of new epoch
-        train_iter = iter(train_loader)
-        z, y = next(train_iter)
-
-    B, C, H, W = z.shape
-    #assert B == batch_size, f"{B=}, {batch_size=}"
-
-    z = z.to(device) # (B, 3, 32, 32)
-    y = y.to(device) # (B,)
-
-    # With probability eta, change class label to the null class label
-    mask = torch.rand(B, device=device) < eta
-    y[mask] = null_label
-
-    t = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
-    epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
-    
-    for micro_step in range(grad_accum_steps):
-
-        if ddp: # only sync gradients on the last micro step
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-
-        # Using alpha_t = t and beta_t = 1-t
-        x = t.view(B, 1, 1, 1) * z + (1-t.view(B, 1, 1, 1)) * epsilon # (B, C, H, W)
-        target = z - epsilon
-
-        # Effective batch size is per_gpu_batch_size * num_gpus * grad_accum_steps, when we call loss.backward() the local gradients
-        # are averaged over all ranks, the gradient on the existing rank has per_gpu_batch_size * num_gpus in the denominator and then
-        # averaging all of these local averages over all ranks will give us the correct final denominator in our effective batch expectation
-        loss = (model(x=x, t=t, y=y) - target).square().mean() / grad_accum_steps # .mean() averages over all dimensions, including batches! 
-        train_loss = loss.detach().item() * grad_accum_steps # for logging, approximation of training loss w/o communicating across gpus
-        loss.backward()
-
-        ##### LOAD DATA FOR NEXT ITERATION -- would probably be cleaner to put the times and noise and null label stuff all inside a dataloader class, but this is just a quick and dirty script so I'm not worrying about it
+        # Get next batch, restart dataloader if epoch completed
         try:
             z, y = next(train_iter)
         except StopIteration:
@@ -392,9 +428,11 @@ for step in range(training_steps):
             train_sampler.set_epoch(epoch) # reshuffles dataloader at start of new epoch
             train_iter = iter(train_loader)
             z, y = next(train_iter)
+
+        B, C, H, W = z.shape
+
         z = z.to(device) # (B, 3, 32, 32)
         y = y.to(device) # (B,)
-        B, C, H, W = z.shape # if not using drop_last=True in dataloader, this can be necessary to update B to avoid an error for the last batch being smaller
 
         # With probability eta, change class label to the null class label
         mask = torch.rand(B, device=device) < eta
@@ -403,17 +441,52 @@ for step in range(training_steps):
         t = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
         epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
         
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = get_lr(step)
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
-    t1 = time.time()
+        for micro_step in range(grad_accum_steps):
 
-    write0(f"Step {step}:{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms    train loss: {train_loss:.6f}    epoch: {epoch}\n", log_file=log_file)
-    
+            if ddp: # only sync gradients on the last micro step
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
 
-        # TODO logging, checkpointing, DDP, grad accum, eval (val loss, FID, sample image grids w/ fixed noise inputs? have to remember to undo the transformation to visualize properly!!! )
+            # Using alpha_t = t and beta_t = 1-t
+            x = t.view(B, 1, 1, 1) * z + (1-t.view(B, 1, 1, 1)) * epsilon # (B, C, H, W)
+            target = z - epsilon
 
-if ddp:
-    dist.destroy_process_group()
+            # Effective batch size is per_gpu_batch_size * num_gpus * grad_accum_steps, when we call loss.backward() the local gradients
+            # are averaged over all ranks, the gradient on the existing rank has per_gpu_batch_size * num_gpus in the denominator and then
+            # averaging all of these local averages over all ranks will give us the correct final denominator in our effective batch expectation
+            loss = (model(x=x, t=t, y=y) - target).square().mean() / grad_accum_steps # .mean() averages over all dimensions, including batches! 
+            train_loss = loss.detach().item() * grad_accum_steps # for logging, approximation of training loss w/o communicating across gpus
+            loss.backward()
+
+            ##### LOAD DATA FOR NEXT ITERATION -- would probably be cleaner to put the times and noise and null label stuff all inside a dataloader class, but this is just a quick and dirty script so I'm not worrying about it
+            try:
+                z, y = next(train_iter)
+            except StopIteration:
+                epoch += 1
+                train_sampler.set_epoch(epoch) # reshuffles dataloader at start of new epoch
+                train_iter = iter(train_loader)
+                z, y = next(train_iter)
+            z = z.to(device) # (B, 3, 32, 32)
+            y = y.to(device) # (B,)
+            B, C, H, W = z.shape # if not using drop_last=True in dataloader, this can be necessary to update B to avoid an error for the last batch being smaller
+
+            # With probability eta, change class label to the null class label
+            mask = torch.rand(B, device=device) < eta
+            y[mask] = null_label
+
+            t = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
+            epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
+            
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = get_lr(step)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        t1 = time.time()
+
+        write0(f"Step {step}:{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms    train loss: {train_loss:.6f}    epoch: {epoch}\n", log_file=log_file)
+        
+
+            # TODO logging, checkpointing, DDP, grad accum, eval (val loss, FID, sample image grids w/ fixed noise inputs? have to remember to undo the transformation to visualize properly!!! )
+
+    if ddp:
+        dist.destroy_process_group()

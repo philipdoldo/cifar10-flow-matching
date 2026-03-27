@@ -29,4 +29,5 @@ srun torchrun \
 --rdzv_id $RANDOM \
 --rdzv_backend c10d \
 --rdzv_endpoint $head_node_ip:29500 \
-/mnt/data_r60_1/adv_robust_project/mnist-flow-model/train.py 
+/mnt/data_r60_1/adv_robust_project/mnist-flow-model/train.py \
+--config "~/mnist-flow-model/template.yaml"
