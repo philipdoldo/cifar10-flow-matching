@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH -o /mnt/data_r60_1/adv_robust_project/mnist-flow-model/logs/train_%A.log
 #SBATCH -e /mnt/data_r60_1/adv_robust_project/mnist-flow-model/logs/train_%A.err
-#SBATCH --time=00-02:00:00
+#SBATCH --time=00-05:00:00
 
 ###source /home/pdoldo/fs/bin/activate
 source $(conda info --base)/etc/profile.d/conda.sh
@@ -30,4 +30,4 @@ srun torchrun \
 --rdzv_backend c10d \
 --rdzv_endpoint $head_node_ip:29500 \
 /mnt/data_r60_1/adv_robust_project/mnist-flow-model/train.py \
---config "~/mnist-flow-model/template.yaml"
+--config "/mnt/data_r60_1/adv_robust_project/mnist-flow-model/template.yaml"
