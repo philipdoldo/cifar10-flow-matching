@@ -130,6 +130,8 @@ import argparse
 import os
 from model import UNet, UNetConfig
 import math
+from datetime import datetime
+import time
 
 def sample(model, batch_size, num_steps, class_labels, device, cfg_weight=4, null_class_label=10):
 
@@ -144,23 +146,44 @@ def sample(model, batch_size, num_steps, class_labels, device, cfg_weight=4, nul
 
     return images  # (batch_size, 3, 32, 32)
 
-def print0(s="",**kwargs):
+def print0(s="", **kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
         print(s, **kwargs)
 
-effective_batch_size = 512
+def write0(s, log_file):
+    """
+    `s` is the string to write to the log file
+    `log_file` is the path to the log.txt file
+    """
+    ddp_rank = int(os.environ.get('RANK', 0))
+    if ddp_rank == 0:
+        with open(log_file, 'a') as f:
+            f.write(s)
+
+def create_log_dir(parent_dir):
+    ddp_rank = int(os.environ.get('RANK', 0))
+    log_dir = None # initialize as None to avoid errors on nonzero ranks
+    if ddp_rank == 0:
+        timestamp = datetime.now().strftime("%m-%d-%Y-%Hh%Mm%Ss")
+        log_dir = os.path.join(parent_dir, f"{timestamp}")
+        os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+effective_batch_size = 1024
 grad_accum_steps = 1
 training_steps = 100000
 batch_size = 128
 eta = 1/11
 null_label = 10
-val_loss_interval = 500
-checkpoint_interval = 500
+val_loss_interval = 50
+checkpoint_interval = 10000
 image_sample_interval = 500
 num_image_samples = 10
 
+save_dir = "/mnt/data_r60_1/adv_robust_project/mnist-flow-model/experiments"
 
+log_dir = create_log_dir(save_dir)
 
 warmup_steps = 1000
 max_lr = 3e-4
@@ -184,29 +207,47 @@ model_config = UNetConfig()
 model = UNet(model_config)
 
 
-use_ddp = int(os.environ.get('RANK', -1)) != -1
+ddp = int(os.environ.get('RANK', -1)) != -1
 
-if use_ddp:
+if ddp:
     dist.init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     world_size = dist.get_world_size()
 
     assert ddp_rank == dist.get_rank(), f"{ddp_rank=}, {dist.get_rank()=}"
-    assert ddp_local_rank == dist.local_rank(), f"{ddp_local_rank=}, {dist.local_rank()=}"
+    ##assert ddp_local_rank == dist.local_rank(), f"{ddp_local_rank=}, {dist.local_rank()=}"
 
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
+    print(f"{ddp_rank=}, {ddp_local_rank=}, {world_size=}, {device=}")
 else:
     ddp_rank = 0
     ddp_local_rank = 0
     world_size = 1
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"{ddp_rank=}, {ddp_local_rank=}, {world_size=}, {device=}")
 
+
+if world_size * batch_size * grad_accum_steps != effective_batch_size:
+    raise ValueError(f"{effective_batch_size=}, {world_size=}, {batch_size=}, {grad_accum_steps=}, {world_size*batch_size*grad_accum_steps=}")
+
+# Initialize log file
+log_file = f"{log_dir}/log.txt"
+if ddp_rank == 0:
+    with open(log_file, 'w') as f:
+        f.write("")
+
+write0(f"Using {world_size} GPU(s)\n", log_file=log_file)
+write0(f"GPU Type: {torch.cuda.get_device_name()}\n", log_file=log_file)
 
 model = model.to(device)
-if use_ddp:
+if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
+num_params = sum(p.numel() for p in model.parameters())
+num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
@@ -246,6 +287,8 @@ train_iter = iter(train_loader)
 for step in range(training_steps):
 
     if step % val_loss_interval == 0 or step == training_steps - 1:
+        torch.cuda.synchronize()
+        t0 = time.time()
         model.eval()
         with torch.no_grad():
             val_loss_accum = 0.0
@@ -257,10 +300,10 @@ for step in range(training_steps):
                 # With probability eta, change class label to the null class label
                 mask_val = torch.rand(B, device=device) < eta
                 y_val[mask_val] = null_label
-                t_val = torch.rand(B, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
+                t_val = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
                 epsilon_val = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
                 
-                x_val = t_val * z_val + (1-t_val) * epsilon_val # (B, C, H, W)
+                x_val = t_val.view(B, 1, 1, 1) * z_val + (1-t_val.view(B, 1, 1, 1)) * epsilon_val # (B, C, H, W)
                 target_val = z_val - epsilon_val
 
                 val_loss = (model(x=x_val, t=t_val, y=y_val) - target_val).square().mean()
@@ -269,9 +312,11 @@ for step in range(training_steps):
                 num_val_batches += 1
             avg_val_loss = val_loss_accum / num_val_batches
         model.train()
-        print0(f"step {step} | val loss {avg_val_loss:.4f}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+        write0(f"step {step} | val loss {avg_val_loss:.4f} | time {t1-t0:.4f}s\n", log_file=log_file)
     
-    if ddp_rank == 0 and (step % image_sample_interval == 0 or step == training_steps - 1):
+    if False and ddp_rank == 0 and (step % image_sample_interval == 0 or step == training_steps - 1):
         
         model.eval()
         images = sample(model, ...) # TODO
@@ -282,17 +327,25 @@ for step in range(training_steps):
         model.train()
 
     if ddp_rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
+        torch.cuda.synchronize()
+        t0 = time.time()
         checkpoint = {
             'step': step,
-            'model': model.module.state_dict() if use_ddp else model.state_dict(),
+            'model': model.module.state_dict() if ddp else model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
         }
-        torch.save(checkpoint, f'checkpoint_step{step}.pt')
+        checkpoint_path = os.path.join(log_dir, f'checkpoint_step{step}.pt')
+        torch.save(checkpoint, checkpoint_path)
+        torch.cuda.synchronize()
+        t1 = time.time()
+        write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
 
 
     train_sampler.set_epoch(epoch) # ensures different shuffle each epoch
 
+    torch.cuda.synchronize()
+    t0 = time.time()
     # Get next batch, restart dataloader if epoch completed
     try:
         z, y = next(train_iter)
@@ -303,7 +356,7 @@ for step in range(training_steps):
         z, y = next(train_iter)
 
     B, C, H, W = z.shape
-    assert B == batch_size, f"{B=}, {batch_size=}"
+    #assert B == batch_size, f"{B=}, {batch_size=}"
 
     z = z.to(device) # (B, 3, 32, 32)
     y = y.to(device) # (B,)
@@ -312,20 +365,23 @@ for step in range(training_steps):
     mask = torch.rand(B, device=device) < eta
     y[mask] = null_label
 
-    t = torch.rand(batch_size, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
+    t = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
     epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
     
     for micro_step in range(grad_accum_steps):
-        # Using alpha_t = t and beta_t = 1-t
-        x = t * z + (1-t) * epsilon # (B, C, H, W)
-        target = z - epsilon
 
-        assert effective_batch_size == (world_size * B * grad_accum_steps)
+        if ddp: # only sync gradients on the last micro step
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+
+        # Using alpha_t = t and beta_t = 1-t
+        x = t.view(B, 1, 1, 1) * z + (1-t.view(B, 1, 1, 1)) * epsilon # (B, C, H, W)
+        target = z - epsilon
 
         # Effective batch size is per_gpu_batch_size * num_gpus * grad_accum_steps, when we call loss.backward() the local gradients
         # are averaged over all ranks, the gradient on the existing rank has per_gpu_batch_size * num_gpus in the denominator and then
         # averaging all of these local averages over all ranks will give us the correct final denominator in our effective batch expectation
         loss = (model(x=x, t=t, y=y) - target).square().mean() / grad_accum_steps # .mean() averages over all dimensions, including batches! 
+        train_loss = loss.detach().item() * grad_accum_steps # for logging, approximation of training loss w/o communicating across gpus
         loss.backward()
 
         ##### LOAD DATA FOR NEXT ITERATION -- would probably be cleaner to put the times and noise and null label stuff all inside a dataloader class, but this is just a quick and dirty script so I'm not worrying about it
@@ -338,21 +394,26 @@ for step in range(training_steps):
             z, y = next(train_iter)
         z = z.to(device) # (B, 3, 32, 32)
         y = y.to(device) # (B,)
+        B, C, H, W = z.shape # if not using drop_last=True in dataloader, this can be necessary to update B to avoid an error for the last batch being smaller
 
         # With probability eta, change class label to the null class label
         mask = torch.rand(B, device=device) < eta
         y[mask] = null_label
 
-        t = torch.rand(batch_size, 1, 1, 1, device=device) # shape (B, 1, 1, 1) for broadcasting, consists of B iid Unif([0,1]) samples
+        t = torch.rand(B, device=device) # shape (B,), will need to view as (B, 1, 1, 1) later for broadcasting, consists of B iid Unif([0,1]) samples
         epsilon = torch.randn(B, C, H, W, device=device) # shape (B, 3, 32, 32) consisting of B iid N(0,1) samples
         
     for param_group in optimizer.param_groups:
         param_group['lr'] = get_lr(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    t1 = time.time()
+
+    write0(f"Step {step}:{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms    train loss: {train_loss:.6f}    epoch: {epoch}\n", log_file=log_file)
     
 
         # TODO logging, checkpointing, DDP, grad accum, eval (val loss, FID, sample image grids w/ fixed noise inputs? have to remember to undo the transformation to visualize properly!!! )
 
-if use_ddp:
+if ddp:
     dist.destroy_process_group()

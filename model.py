@@ -65,6 +65,9 @@ class TimeAndClassEmbedding(nn.Module):
 
         output a batch of embedding vectors: shape (B, d)
         """
+        if t.shape != y.shape or len(t.shape) != 1:
+            raise ValueError(f"{t.shape=}, {y.shape=}")
+        print(f"{t.shape=}, {y.shape=}   ----")
         class_emb = self.class_embedding(y) # shape (B, d)
         print(f"{class_emb.shape=}")
         time_emb = self.time_embedding(t) # shape (B, d)
@@ -486,6 +489,8 @@ class UNet(nn.Module):
             raise ValueError(f"{x.shape=}, {H=}, {self.H_init=}")
         if C != self.channels:
             raise ValueError(f"{x.shape=}, {C=}, {self.channels=}")
+        if t.shape != y.shape or len(t.shape) != 1 or t.shape[0] != B:
+            raise ValueError(f"{t.shape=}, {y.shape=}, {x.shape=}")
         
         z = self.time_and_class_embedding(t, y) # shape (B, d)
         if z.shape[0] != B or len(z.shape) != 2:
