@@ -1,5 +1,5 @@
 # cifar10-flow-matching
-I implemented and trained a flow model on cifar10 to generate images given a class label with classifier-free guidance. I wrote this just for the learning experience. Here are some images my model generated:
+I implemented and trained a flow model on cifar10 to generate images given a class label with classifier-free guidance. I did this just for the learning experience and it should not be taken very seriously. Here are some images my model generated:
 
 ![Logo](samples.png)
 
